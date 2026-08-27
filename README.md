@@ -7,6 +7,7 @@ Allows you to find the AWS account ID that owns an S3 bucket. The program perfor
 - **Binary Search**: Efficiently searches for each digit of the AWS account ID using binary search.
 - **Parallel Execution**: Concurrently searches possible digits using goroutines to speed up the discovery process.
 - **AWS IAM Role Support**: Supports assuming a specific role (`role_arn`) to check access permissions.
+- **Named Profile Support**: Optionally load credentials from a named AWS profile (`profile`).
 - **Region Caching**: Caches the S3 bucket region to reduce redundant region lookups during API calls.
 
 ## Installation
@@ -22,16 +23,18 @@ Assuming you have Go installed and configured (i.e. with $GOPATH/bin in your $PA
 You will need an IAM role that you can assume with `ListBucket` or `GetObject` permissions on the bucket of interest.
 
 ```bash
-S3AccountFinder -role_arn <role_arn> -path <s3_path>
+S3AccountFinder -role_arn <role_arn> -path <s3_path> [-profile <aws_profile>]
 ```
 Example
 
 - `S3AccountFinder -role_arn arn:aws:iam::012345678901:role/s3-account-finder -path some-bucket`
+- `S3AccountFinder -role_arn arn:aws:iam::012345678901:role/s3-account-finder -path some-bucket -profile my-profile`
 
 ### Parameters
 
 - `-role_arn`: The Amazon Resource Name (ARN) of the IAM role to assume.
 - `-path`: The S3 bucket or S3 bucket path (e.g., `s3://mybucket` or `s3://mybucket/mykey`) to check access against.
+- `-profile` (optional): The named AWS profile to load credentials from (as configured in `~/.aws/config` / `~/.aws/credentials`). Defaults to the `AWS_PROFILE` environment variable or the default profile.
 
 
 ## Acknowledgments

@@ -25,13 +25,19 @@ var bucketRegionCache sync.Map // Cache for storing bucket regions
 func main() {
 	roleArn := flag.String("role_arn", "", "ARN of the role to assume")
 	path := flag.String("path", "", "s3 bucket or bucket/path to test with")
+	profile := flag.String("profile", "", "AWS profile to use (defaults to the AWS_PROFILE env var or the default profile)")
 	flag.Parse()
 
 	if *roleArn == "" || *path == "" {
 		log.Fatalf("role_arn and path are required")
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	loadOpts := []func(*config.LoadOptions) error{}
+	if *profile != "" {
+		loadOpts = append(loadOpts, config.WithSharedConfigProfile(*profile))
+	}
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(), loadOpts...)
 	if err != nil {
 		log.Fatalf("failed to load AWS configuration: %v", err)
 	}
