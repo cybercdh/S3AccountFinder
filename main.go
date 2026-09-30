@@ -45,7 +45,11 @@ func main() {
 	bucket, key := toS3Args(*path)
 
 	// Try accessing the bucket without any restrictions
-	if !canAccessWithPolicy(cfg, bucket, key, *roleArn, nil) {
+	ok, err := canAccessWithPolicy(cfg, bucket, key, *roleArn, nil)
+	if err != nil {
+		log.Fatalf("initial access check failed: %v", err)
+	}
+	if !ok {
 		fmt.Fprintf(os.Stderr, "%s cannot access %s\n", *roleArn, bucket)
 		os.Exit(1)
 	}
@@ -74,30 +78,41 @@ func searchAccountID(cfg aws.Config, bucket, key, roleArn string) string {
 	return accountID
 }
 
-// Finds the next digit concurrently using goroutines
+// Finds the next digit concurrently using goroutines. Every digit 0-9 is
+// tested in parallel; exactly one prefix should be accessible. A per-digit
+// access error is treated as "not this digit" so one transient failure no
+// longer aborts the whole search.
 func findNextDigitConcurrently(cfg aws.Config, bucket, key, roleArn, prefix string) string {
 	possibleDigits := []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
-	ch := make(chan string, len(possibleDigits))
+
+	type digitResult struct {
+		digit string
+		ok    bool
+	}
+	ch := make(chan digitResult, len(possibleDigits))
 
 	for _, digit := range possibleDigits {
 		go func(digit string) {
 			testPrefix := prefix + digit
 			policy := getPolicy([]string{testPrefix + "*"})
-			if canAccessWithPolicy(cfg, bucket, key, roleArn, policy) {
-				ch <- digit
-			} else {
-				ch <- ""
+			ok, err := canAccessWithPolicy(cfg, bucket, key, roleArn, policy)
+			if err != nil {
+				// A transient error is not a positive match; log and move on
+				// rather than killing the search for every other digit.
+				fmt.Fprintf(os.Stderr, "warning: probe for prefix %q failed: %v\n", testPrefix, err)
+				ok = false
 			}
+			ch <- digitResult{digit: digit, ok: ok}
 		}(digit)
 	}
 
+	found := ""
 	for range possibleDigits {
-		if nextDigit := <-ch; nextDigit != "" {
-			return nextDigit
+		if r := <-ch; r.ok {
+			found = r.digit
 		}
 	}
-
-	return ""
+	return found
 }
 
 // Constructs the policy to check for the account ID prefixes
@@ -120,8 +135,12 @@ func getPolicy(prefixes []string) map[string]interface{} {
 	}
 }
 
-// Assumes the role and applies the test policy to check access
-func canAccessWithPolicy(cfg aws.Config, bucket, key, roleArn string, policy map[string]interface{}) bool {
+// Assumes the role and applies the test policy to check access. Returns
+// (accessible, error): a clean 403/AccessDenied is (false, nil), a 404/NotFound
+// is (true, nil) because the object/bucket resolved under the policy, and
+// anything else is a real error the caller decides how to handle. Previously
+// every unexpected condition called log.Fatalf, so one hiccup aborted the scan.
+func canAccessWithPolicy(cfg aws.Config, bucket, key, roleArn string, policy map[string]interface{}) (bool, error) {
 	ctx := context.TODO()
 
 	// Assume the role using stscreds
@@ -145,7 +164,7 @@ func canAccessWithPolicy(cfg aws.Config, bucket, key, roleArn string, policy map
 		// Get the bucket region
 		region, err := manager.GetBucketRegion(ctx, s3Svc, bucket)
 		if err != nil {
-			log.Fatalf("Failed to get bucket region: %v", err)
+			return false, fmt.Errorf("failed to get bucket region: %w", err)
 		}
 		bucketRegionCache.Store(bucket, region)
 		bucketRegion = region
@@ -157,55 +176,37 @@ func canAccessWithPolicy(cfg aws.Config, bucket, key, roleArn string, policy map
 		o.Region = bucketRegion.(string)
 	})
 
-	var result bool
+	var headErr error
 	if key != "" {
-		// Try HeadObject
-		_, err := s3Svc.HeadObject(ctx, &s3.HeadObjectInput{
+		_, headErr = s3Svc.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
 		})
-		if err != nil {
-			var apiErr smithy.APIError
-			if errors.As(err, &apiErr) {
-				errorCode := apiErr.ErrorCode()
-				if errorCode == "403" || errorCode == "AccessDenied" || errorCode == "Forbidden" {
-					result = false
-				} else if errorCode == "404" || errorCode == "NotFound" {
-					result = true
-				} else {
-					log.Fatalf("Unexpected error code %s: %v", errorCode, err)
-				}
-			} else {
-				log.Fatalf("Unexpected error: %v", err)
-			}
-		} else {
-			result = true
-		}
 	} else {
-		// Try HeadBucket
-		_, err := s3Svc.HeadBucket(ctx, &s3.HeadBucketInput{
+		_, headErr = s3Svc.HeadBucket(ctx, &s3.HeadBucketInput{
 			Bucket: aws.String(bucket),
 		})
-		if err != nil {
-			var apiErr smithy.APIError
-			if errors.As(err, &apiErr) {
-				errorCode := apiErr.ErrorCode()
-				if errorCode == "403" || errorCode == "AccessDenied" || errorCode == "Forbidden" {
-					result = false
-				} else if errorCode == "404" || errorCode == "NotFound" {
-					result = true
-				} else {
-					log.Fatalf("Unexpected error code %s: %v", errorCode, err)
-				}
-			} else {
-				log.Fatalf("Unexpected error: %v", err)
-			}
-		} else {
-			result = true
-		}
 	}
+	return interpretHeadErr(headErr)
+}
 
-	return result
+// interpretHeadErr maps a HeadObject/HeadBucket result to (accessible, error).
+func interpretHeadErr(err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false, fmt.Errorf("unexpected error: %w", err)
+	}
+	switch apiErr.ErrorCode() {
+	case "403", "AccessDenied", "Forbidden":
+		return false, nil
+	case "404", "NotFound":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unexpected error code %s: %w", apiErr.ErrorCode(), err)
+	}
 }
 
 // Converts the path to bucket and key
